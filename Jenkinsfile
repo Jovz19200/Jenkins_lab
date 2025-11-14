@@ -52,7 +52,7 @@ pipeline {
                 // This 'withCredentials' block securely creates that file.
                 withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKLER_USER', passwordVariable: 'DOCKER_PASS')]) {
                     // Create the config.json file for Kaniko
-                    sh "echo '{\"auths\":{\"https://index.docker.io/v1/\":{\"auth\":\"$(echo -n ${DOCKLER_USER}:${DOCKER_PASS} | base64 -w 0)\"}}}' > /kaniko/.docker/config.json"
+                    sh "echo '{\"auths\":{\"https://index.docker.io/v1/\":{\"auth\":\"\$(echo -n ${DOCKLER_USER}:${DOCKER_PASS} | base64 -w 0)\"}}}' > /kaniko/.docker/config.json"
                     
                     // Run the Kaniko command to build and push the image
                     sh """
