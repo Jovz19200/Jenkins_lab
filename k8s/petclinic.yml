@@ -3,6 +3,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: petclinic
+  namespace: petclinic-prod
 spec:
   type: NodePort
   ports:
@@ -16,6 +17,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: petclinic
+  namespace: petclinic-prod
   labels:
     app: petclinic
 spec:
@@ -30,10 +32,22 @@ spec:
     spec:
       containers:
         - name: workload
-          image: dsyer/petclinic
+          image: nniyogisubizo/petclinic:latest
           env:
             - name: SPRING_PROFILES_ACTIVE
               value: postgres
+            - name: SPRING_DATASOURCE_URL
+              value: jdbc:postgresql://demo-db.petclinic-prod.svc.cluster.local:5432/petclinic
+            - name: SPRING_DATASOURCE_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: demo-db
+                  key: username
+            - name: SPRING_DATASOURCE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: demo-db
+                  key: password
             - name: SERVICE_BINDING_ROOT
               value: /bindings
             - name: SPRING_APPLICATION_JSON
