@@ -1,17 +1,16 @@
 pipeline {
-    // We will define an agent for each stage, not one for the whole pipeline
+    // We define an agent for each stage, not one for the whole pipeline
     agent none 
 
     environment {
-        // This variable is available to all stages
-        DOCKER_IMAGE_NAME = "nniyogisubizo/spring-petclinic" 
+        DOCKER_IMAGE_NAME = "jovz19200/spring-petclinic" // Your Docker Hub repo
     }
 
     stages {
         
         stage('Checkout') {
             // This stage just gets the code.
-            agent any // Use any available agent just to checkout
+            agent any // Use the default agent just to checkout
             steps {
                 echo 'Checking out code from GitHub...'
                 checkout scm
@@ -22,157 +21,168 @@ pipeline {
         }
 
         stage('Build with Maven') {
-            // Use a Maven agent just to build the .jar file
+            // Use a Maven pod as the agent
             agent {
-                docker { image 'maven:3.8-openjdk-17' }
+                kubernetes {
+                    yaml """
+                    apiVersion: v1
+                    kind: Pod
+                    spec:
+                      containers:
+                      - name: maven
+                        image: maven:3.8-openjdk-17
+                        command:
+                        - sleep
+                        args:
+                        - 999999
+                    """
+                }
             }
             steps {
-                // 'Unstash' (get) the saved code from the 'Checkout' stage
-                unstash 'source'
-                echo 'Building the application with Maven...'
-                sh 'mvn clean package'
-                // 'Stash' the results (the .jar, Dockerfile, and k8s files)
-                // for the next stages.
-                stash(name: 'built-files', includes: 'target/spring-petclinic-*.jar, Dockerfile, k8s/*')
+                // 'maven' is the container name from the YAML above
+                container('maven') {
+                    // 'Unstash' (get) the saved code from the 'Checkout' stage
+                    unstash 'source'
+                    echo 'Building the application with Maven...'
+                    sh 'mvn clean package'
+                    // 'Stash' the results for Sonar and Kaniko
+                    // We need source code, pom, and the built .jar
+                    stash(name: 'built-files', includes: 'target/*, Dockerfile, k8s/*, pom.xml, src/*')
+                }
+            }
+        }
+
+        // --- 1. NEW STAGE FOR SONARQUBE ANALYSIS ---
+        stage('SonarQube Analysis') {
+            // We use a Maven agent again because it has Java and the
+            // Sonar scanner can run via Maven.
+            agent {
+                kubernetes {
+                    yaml """
+                    apiVersion: v1
+                    kind: Pod
+                    spec:
+                      containers:
+                      - name: maven
+                        image: maven:3.8-openjdk-17
+                        command:
+                        - sleep
+                        args:
+                        - 999999
+                    """
+                }
+            }
+            steps {
+                container('maven') {
+                    // Get the built files
+                    unstash 'built-files'
+                    
+                    // Point to the server you named 'SonarQube' in Jenkins config
+                    withSonarQubeEnv('SonarQube') {
+                        // Run the scanner command
+                        sh 'mvn sonar:sonar'
+                    }
+                }
+            }
+        }
+
+        // --- 2. NEW STAGE FOR QUALITY GATE ---
+        stage('SonarQube Quality Gate') {
+            // This stage just waits, so a simple agent is fine
+            agent any 
+            steps {
+                echo "Checking SonarQube Quality Gate..."
+                // This step pauses the pipeline and waits for SonarQube
+                // to finish its analysis.
+                // If the code fails the "Quality Gate", this step
+                // will fail the entire pipeline.
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
             }
         }
 
         stage('Build and Push Image (Kaniko)') {
-            // This is the fix: Use a Kaniko agent to build the image
+            // New syntax for the Kaniko pod
             agent {
-                docker { image 'gcr.io/kaniko-project/executor-debug:latest' }
+                kubernetes {
+                    yaml """
+                    apiVersion: v1
+                    kind: Pod
+                    spec:
+                      containers:
+                      - name: kaniko
+                        image: gcr.io/kaniko-project/executor-debug:latest
+                        command:
+                        - sleep
+                        args:
+                        - 999999
+                    """
+                }
             }
             steps {
-                // Get the saved files from the 'Build' stage
-                unstash 'built-files'
-                
-                echo "Building and pushing image: ${DOCKER_IMAGE_NAME}:${env.BUILD_NUMBER}"
-                
-                // Kaniko needs Docker Hub credentials in a special config file.
-                // This 'withCredentials' block securely creates that file.
-                withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKLER_USER', passwordVariable: 'DOCKER_PASS')]) {
-                    // Create the config.json file for Kaniko
-                    sh "echo '{\"auths\":{\"https://index.docker.io/v1/\":{\"auth\":\"\$(echo -n ${DOCKLER_USER}:${DOCKER_PASS} | base64 -w 0)\"}}}' > /kaniko/.docker/config.json"
+                // 'kaniko' is the container name
+                container('kaniko') {
+                    // We only need the files for the Docker image
+                    unstash 'built-files'
                     
-                    // Run the Kaniko command to build and push the image
-                    sh """
-                    /kaniko/executor --context `pwd` \
-                                     --dockerfile `pwd`/Dockerfile \
-                                     --destination "${DOCKER_IMAGE_NAME}:${env.BUILD_NUMBER}"
-                    """
+                    echo "Building and pushing image: ${DOCKER_IMAGE_NAME}:${env.BUILD_NUMBER}"
+                    
+                    withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKLER_USER', passwordVariable: 'DOCKER_PASS')]) {
+                        // Create the config.json file for Kaniko
+                        sh "echo '{\"auths\":{\"https://index.docker.io/v1/\":{\"auth\":\"\$(echo -n ${DOCKLER_USER}:${DOCKER_PASS} | base64 -w 0)\"}}}' > /kaniko/.docker/config.json"
+                        
+                        // Run the Kaniko command
+                        sh """
+                        /kaniko/executor --context `pwd` \
+                                         --dockerfile `pwd`/Dockerfile \
+                                         --destination "${DOCKER_IMAGE_NAME}:${env.BUILD_NUMBER}"
+                        """
+                    }
                 }
             }
         }
 
         stage('Deploy to Kubernetes') {
-            // Use an agent that has 'kubectl' and 'sed'
+            // New syntax for the kubectl pod
             agent {
-                docker { image 'bitnami/kubectl:latest' }
+                 kubernetes {
+                    yaml """
+                    apiVersion: v1
+                    kind: Pod
+                    spec:
+                      containers:
+                      - name: kubectl
+                        image: bitnami/kubectl:latest
+                        command:
+                        - sleep
+                        args:
+                        - 999999
+                    """
+                }
             }
             steps {
-                // Get the saved files again
-                unstash 'built-files'
-                
-                echo "Deploying to Kubernetes..."
-                
-                // This command updates your k8s/petclinic.yml file with the new image
-                sh "sed -i 's|image: .*|image: ${DOCKER_IMAGE_NAME}:${env.BUILD_NUMBER}|g' k8s/petclinic.yml"
-                
-                echo "Applying new Kubernetes config to 'petclinic-prod' namespace..."
-                
-                // Apply all your k8s files
-                sh "kubectl apply -f k8s/ns-prod.yml"
-                sh "kubectl apply -f k8s/db.yml -n petclinic-prod"
-                sh "kubectl apply -f k8s/petclinic.yml -n petclinic-prod"
-                
-                // Check the rollout status
-                sh "kubectl rollout status deployment/petclinic -n petclinic-prod"
+                // 'kubectl' is the container name
+                container('kubectl') {
+                    // We only need the k8s YAML files
+                    unstash 'built-files'
+                    
+                    echo "Deploying to Kubernetes..."
+                    
+                    // This command updates your k8s/petclinic.yml file with the new image
+                    sh "sed -i 's|image: .*|image: ${DOCKER_IMAGE_NAME}:${env.BUILD_NUMBER}|g' k8s/petclinic.yml"
+                    
+                    echo "Applying new Kubernetes config to 'petclinic-prod' namespace..."
+                    
+                    // Apply all your k8s files
+                    sh "kubectl apply -f k8s/ns-prod.yml"
+                    sh "kubectl apply -f k8s/db.yml -n petclinic-prod"
+                    sh "kubectl apply -f k8s/petclinic.yml -n petclinic-prod"
+                    
+                    // Check the rollout status
+                    sh "kubectl rollout status deployment/petclinic -n petclinic-prod"
+                }
             }
         }
     }
 }
-
-
-
-
-
-// pipeline {
-//     agent any // Runs the pipeline on any available Jenkins agent
-
-//     environment {
-//         DOCKER_IMAGE_NAME = "nniyogisubizo/spring-petclinic" 
-//     }
-
-//     stages {
-//         stage('Checkout') { //
-//             steps {
-//                 echo 'Checking out code from GitHub...'
-//                 checkout scm
-//             }
-//         }
-
-//         stage('Build') { //
-//             steps {
-//                 echo 'Building the application with Maven...'
-//                 // This runs Maven inside a Docker container
-//                 sh 'docker run -v $WORKSPACE:/app -w /app maven:3.8-openjdk-17 mvn clean package'
-//             }
-//         }
-        
-//         stage('Test') { //
-//             steps {
-//                 echo 'Testing (skipping for this lab)...'
-//                 // In a real project, you would run 'mvn test' here
-//             }
-//         }
-        
-//         stage('Static Analysis (Optional)') { //
-//             steps {
-//                 echo 'Skipping SonarQube scan for now.'
-//             }
-//         }
-
-//         stage('Build Docker Image') {
-//             steps {
-//                 // The $BUILD_NUMBER is a unique number from Jenkins (e.g., 1, 2, 3)
-//                 echo "Building Docker image: ${DOCKER_IMAGE_NAME}:${env.BUILD_NUMBER}"
-//                 sh "docker build -t ${DOCKER_IMAGE_NAME}:${env.BUILD_NUMBER} ."
-//             }
-//         }
-
-//         stage('Push to Docker Hub') { //
-//             steps {
-//                 echo "Pushing image to Docker Hub..."
-//                 // Use the 'dockerhub-creds' ID you created in Step 4
-//                 withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
-//                     sh "docker login -u $DOCKER_USER -p $DOCKER_PASS"
-//                     sh "docker push ${DOCKER_IMAGE_NAME}:${env.BUILD_NUMBER}"
-//                 }
-//             }
-//         }
-
-//         stage('Deploy to Kubernetes') { //
-//             steps {
-//                 echo "Deploying to Kubernetes..."
-                
-//                 // 1. This updates the image in YOUR file: k8s/petclinic.yml
-//                 sh "sed -i 's|image: .*|image: ${DOCKER_IMAGE_NAME}:${env.BUILD_NUMBER}|g' k8s/petclinic.yml"
-                
-//                 echo "Applying new Kubernetes config to 'petclinic-prod' namespace..."
-                
-//                 // 2. Apply the namespace first (good practice)
-//                 sh "kubectl apply -f k8s/ns-prod.yml"
-
-//                 // 3. Apply the database and app, specifying the namespace
-//                 sh "kubectl apply -f k8s/db.yml -n petclinic-prod"
-//                 sh "kubectl apply -f k8s/petclinic.yml -n petclinic-prod"
-                
-//                 // 4. Check the rollout status in the correct namespace
-//                 sh "kubectl rollout status deployment/petclinic -n petclinic-prod"
-//             }
-//         }
-//     }
-// }
-
-
-
